@@ -295,5 +295,13 @@ if __name__ == '__main__':
     node1 = Node(5000, TARGET_HASH, ALPHABET, is_coordinator=True)
     node1.start_server()
     time.sleep(2)
+    
+    node2 = Node(5001, TARGET_HASH, ALPHABET)
+    node2.start_server()
+    time.sleep(1)
+    node2.connect_to_peer('127.0.0.1', 5000)
 
-    pass
+    node3 = Node(5002, TARGET_HASH, ALPHABET)
+    node3.start_server()
+    time.sleep(1)
+    node3.connect_to_peer('127.0.0.1', 5001)
