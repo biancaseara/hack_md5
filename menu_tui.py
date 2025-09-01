@@ -4,12 +4,6 @@ from textual.containers import Grid, Container, Vertical, Horizontal
 import threading
 from hack_md5 import Node
 
-class ExclusiveCheckbox(Checkbox):
-    """Checkbox that triggers deselection of others in a group."""
-    def __init__(self, label: str, group: str, **kwargs):
-        super().__init__(label, **kwargs)
-        self.group = group
-
 class HackMD5App(App):
     CSS = """
     Grid {
@@ -19,17 +13,26 @@ class HackMD5App(App):
         align: center middle;
     }
     #menu_box {
-        width: 50;
-        min-height: 32;
+        width: 60;
+        min-height: 36;
         padding: 2 2;
         border: solid $accent;
         background: $panel;
         align: center middle;
     }
+    Vertical {
+        align: center middle;
+        width: 100%;
+    }
+    Horizontal {
+        align: center middle;
+        width: 100%;
+    }
     #titulo {
         text-align: center;
         color: cyan;
         margin-bottom: 2;
+        width: 100%;
     }
     Button {
         width: 100%;
@@ -37,15 +40,21 @@ class HackMD5App(App):
     }
     Input {
         width: 100%;
+        text-align: center;
     }
     Checkbox {
         width: auto;
         margin-right: 0;
+        align: center middle;
     }
     #checkboxes {
-        margin-bottom: 1;
+        margin-bottom: 2;
         width: 100%;
-        /* gap: 0; removido pois não é suportado */
+        align: center middle;
+    }
+    #coordenador_options, #trabalhador_options {
+        align: center middle;
+        width: 100%;
     }
     #log {
         height: 10;
@@ -53,8 +62,14 @@ class HackMD5App(App):
         overflow-y: auto;
         background: $boost;
         border: solid $accent;
+        width: 100%;
+        align: center middle;
     }
     """
+
+    def __init__(self):
+        super().__init__()
+        self.selected_role = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -62,19 +77,28 @@ class HackMD5App(App):
             Container(
                 Vertical(
                     Static("Menu Hack_MD5", id="titulo"),
-                    Input(value="", placeholder="Porta", id="porta"),
-                    Input(value="", placeholder="Hash alvo (MD5)", id="hash"),
                     Horizontal(
-                        ExclusiveCheckbox("Coordenador", group="role", id="coordenador"),
-                        ExclusiveCheckbox("Trabalhador", group="role", id="trabalhador"),
+                        Checkbox("Coordenador", id="coordenador"),
+                        Checkbox("Trabalhador", id="trabalhador"),
                         id="checkboxes"
+                    ),
+                    Container(
+                        Vertical(
+                            Input(value="", placeholder="Porta para ouvir conexões", id="porta"),
+                            Input(value="", placeholder="Hash alvo (MD5)", id="hash"),
+                        ),
+                        id="coordenador_options"
+                    ),
+                    Container(
+                        Vertical(
+                            Input(value="", placeholder="Endereço IP:Porta do coordenador", id="coordenador_addr"),
+                        ),
+                        id="trabalhador_options"
                     ),
                     Horizontal(
                         Button("Iniciar nó", id="start"),
-                        Button("Conectar peer", id="connect"),
                         Button("Sair", id="quit"),
                     ),
-                    Input(value="", placeholder="Host:Port peer", id="peer_addr"),
                     Log(id="log"),
                 ),
                 id="menu_box"
@@ -86,18 +110,27 @@ class HackMD5App(App):
         self.node_thread = None
         self.node = None
         self.node_running = False
+        self.update_fields()
+
+    def update_fields(self):
+        self.query_one("#coordenador_options").display = self.selected_role == "coordenador"
+        self.query_one("#trabalhador_options").display = self.selected_role == "trabalhador"
+
+    async def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if event.value:
+            if event.checkbox.id == "coordenador":
+                self.selected_role = "coordenador"
+                self.query_one("#trabalhador", Checkbox).value = False
+            elif event.checkbox.id == "trabalhador":
+                self.selected_role = "trabalhador"
+                self.query_one("#coordenador", Checkbox).value = False
+        else:
+            if not self.query_one("#coordenador", Checkbox).value and not self.query_one("#trabalhador", Checkbox).value:
+                self.selected_role = None
+        self.update_fields()
 
     def tui_log(self, msg):
         self.query_one("#log", Log).write(msg)
-
-    async def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
-        # Exclusividade: só uma marcada por vez.
-        if isinstance(event.checkbox, ExclusiveCheckbox) and event.value:
-            for other_id in ["coordenador", "trabalhador"]:
-                if event.checkbox.id != other_id:
-                    other = self.query_one(f"#{other_id}", ExclusiveCheckbox)
-                    if other.value:
-                        other.value = False
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start":
@@ -105,46 +138,60 @@ class HackMD5App(App):
                 self.tui_log("[INFO] Nó já está em execução.")
                 return
 
-            porta = int(self.query_one("#porta", Input).value.strip())
-            hash_alvo = self.query_one("#hash", Input).value.strip()
-            is_coordinator = self.query_one("#coordenador", Checkbox).value
-            is_worker = self.query_one("#trabalhador", Checkbox).value
-
-            if not is_coordinator and not is_worker:
-                self.tui_log("[ERROR] Selecione 'Coordenador' ou 'Trabalhador'.")
+            if not self.selected_role:
+                self.tui_log("[ERROR] Selecione 'Coordenador' ou 'Trabalhador' antes de iniciar.")
                 return
 
-            self.node = Node(
-                porta,
-                hash_alvo,
-                is_coordinator=is_coordinator,
-                is_worker=is_worker
-            )
+            if self.selected_role == "coordenador":
+                porta = self.query_one("#porta", Input).value.strip()
+                hash_alvo = self.query_one("#hash", Input).value.strip()
+                if not porta.isdigit():
+                    self.tui_log("[ERROR] Porta inválida.")
+                    return
+                if not hash_alvo:
+                    self.tui_log("[ERROR] Informe o hash alvo.")
+                    return
+                porta = int(porta)
+                self.node = Node(
+                    porta,
+                    hash_alvo,
+                    is_coordinator=True,
+                    is_worker=False
+                )
+                self.node.print = self.tui_log
+                if hasattr(self.node.hash_cracker, "print"):
+                    self.node.hash_cracker.print = self.tui_log
+                self.node_thread = threading.Thread(target=self.run_node, daemon=True)
+                self.node_thread.start()
+                self.node_running = True
+                self.tui_log(f"[INFO] Coordenador iniciado na porta {porta} com hash alvo {hash_alvo}.")
 
-            self.node.print = self.tui_log
-            if hasattr(self.node.hash_cracker, "print"):
-                self.node.hash_cracker.print = self.tui_log
-            self.node_thread = threading.Thread(target=self.run_node, daemon=True)
-            self.node_thread.start()
-            self.node_running = True
-            tipo = "Coordenador" if is_coordinator else "Trabalhador"
-            self.tui_log(f"[INFO] Nó iniciado na porta {porta} como {tipo}.")
-
-        elif event.button.id == "connect":
-            if not self.node_running or not self.node:
-                self.tui_log("[ERROR] Inicie o nó antes de conectar a peers.")
-                return
-            peer_addr = self.query_one("#peer_addr", Input).value.strip()
-            if ":" not in peer_addr:
-                self.tui_log("[ERROR] Endereço do peer no formato host:port")
-                return
-            host, port = peer_addr.split(":")
-            try:
+            elif self.selected_role == "trabalhador":
+                coord_addr = self.query_one("#coordenador_addr", Input).value.strip()
+                if ":" not in coord_addr:
+                    self.tui_log("[ERROR] Endereço do coordenador deve ser no formato IP:porta.")
+                    return
+                ip, port = coord_addr.split(":")
+                if not port.isdigit():
+                    self.tui_log("[ERROR] Porta do coordenador inválida.")
+                    return
                 port = int(port)
-                threading.Thread(target=self.node.connect_to_peer, args=(host, port), daemon=True).start()
-                self.tui_log(f"[INFO] Conectando a peer {peer_addr} ...")
-            except Exception as e:
-                self.tui_log(f"[ERROR] Falha ao conectar a peer: {e}")
+                import random
+                local_port = random.randint(4000, 9000)
+                self.node = Node(
+                    local_port,
+                    "",  # hash alvo vazio para trabalhador
+                    is_coordinator=False,
+                    is_worker=True
+                )
+                self.node.print = self.tui_log
+                if hasattr(self.node.hash_cracker, "print"):
+                    self.node.hash_cracker.print = self.tui_log
+                self.node_thread = threading.Thread(target=self.run_node, daemon=True)
+                self.node_thread.start()
+                self.node_running = True
+                threading.Thread(target=self.node.connect_to_peer, args=(ip, port), daemon=True).start()
+                self.tui_log(f"[INFO] Trabalhador iniciado e conectando ao coordenador {ip}:{port}.")
 
         elif event.button.id == "quit":
             self.exit()
