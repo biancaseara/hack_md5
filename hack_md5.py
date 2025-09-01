@@ -5,8 +5,7 @@ import time
 import hashlib
 import itertools
 import string
-
-SHARED_CHAR_COUNT = 1
+import random
 
 # Classes auxiliares
 class Utils:
@@ -57,17 +56,19 @@ class HashCracker:
     
 # Classe Principal do Nó
 class Node:
-    def __init__(self, port, target_hash, alphabet):
+    def __init__(self, port, target_hash, alphabet, is_coordinator=False):
         self.host = '127.0.0.1'
         self.port = port
-        self.peer_list = {f"{self.host}:{self.port}": {"host": self.host, "port": self.port}}
+        self.peer_list = {f"{self.host}:{self.port}": {"host": self.host, "port": self.port, "is_coordinator": is_coordinator}}
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = True
         self.lamport_clock = 0
+        self.is_coordinator = is_coordinator
+        self.shared_char_count = 1
 
         self.hash_cracker = HashCracker(target_hash, alphabet)
         
-        # Atributos de Ricart-Agrawala movidos para a classe Node
+        # Atributos de Ricart-Agrawala
         self.in_critical_section = False
         self.requesting_critical_section = False
         self.replies_received = 0
@@ -81,7 +82,10 @@ class Node:
             print(f"[DEBUG] Servidor ouvindo em {self.host}:{self.port}")
             accept_thread = threading.Thread(target=self.accept_connections)
             accept_thread.start()
-            self.request_access()
+
+            if self.is_coordinator:
+                print("[DEBUG] Nó é o coordenador do sistema.")
+            
         except Exception as e:
             print(f"[ERROR] Erro ao iniciar o servidor: {e}")
             self.running = False
@@ -110,7 +114,7 @@ class Node:
             if message['type'] == 'new_peer':
                 peer_address = f"{message['host']}:{message['port']}"
                 if peer_address not in self.peer_list:
-                    self.peer_list[peer_address] = {"host": message['host'], "port": message['port']}
+                    self.peer_list[peer_address] = {"host": message['host'], "port": message['port'], "is_coordinator": message.get("is_coordinator", False)}
                     print(f"[DEBUG] Adicionado novo peer à lista: {peer_address}")
                     print(f"[DEBUG] Lista de peers atualizada: {self.peer_list}")
                 response = {"type": "peer_list", "peers": self.peer_list, "clock": self.lamport_clock}
@@ -118,6 +122,7 @@ class Node:
                 
             elif message['type'] == 'peer_list':
                 self.update_peer_list(message['peers'])
+                self.request_access()
 
             elif message['type'] == 'request':
                 request_clock = message['clock']
@@ -143,8 +148,13 @@ class Node:
             elif message['type'] == 'found_word':
                 self.hash_cracker.found_word = message['word']
                 print(f"[SUCCESS] Palavra encontrada por outro nó: {self.hash_cracker.found_word}")
-                self.request_access()
                 
+            elif message['type'] == 'get_char_count_request':
+                if self.is_coordinator:
+                    response_message = {"type": "char_count_reply", "char_count": self.shared_char_count}
+                    self.shared_char_count += 1
+                    conn.sendall(json.dumps(response_message).encode('utf-8'))
+            
             else:
                 print(f"[DEBUG] Mensagem recebida: {message}")
         
@@ -160,7 +170,7 @@ class Node:
             print(f"[DEBUG] Conectado a {peer_host}:{peer_port}")
 
             self.lamport_clock += 1
-            message = {"type": "new_peer", "host": self.host, "port": self.port, "clock": self.lamport_clock}
+            message = {"type": "new_peer", "host": self.host, "port": self.port, "is_coordinator": self.is_coordinator, "clock": self.lamport_clock}
             peer_socket.sendall(json.dumps(message).encode('utf-8'))
 
             response_data = peer_socket.recv(4096).decode('utf-8')
@@ -169,8 +179,10 @@ class Node:
             if response['type'] == 'peer_list':
                 self.update_peer_list(response['peers'])
                 print(f"[DEBUG] Lista de peers recebida e atualizada. Tamanho: {len(self.peer_list)}")
-                self.request_access()
-
+                # >>> NOVO CÓDIGO AQUI
+                if self.peer_list:
+                    threading.Thread(target=self.request_access).start()
+                # <<< NOVO CÓDIGO AQUI
         except Exception as e:
             print(f"[ERROR] Erro ao conectar a {peer_host}:{peer_port}: {e}")
         finally:
@@ -206,22 +218,55 @@ class Node:
         self.in_critical_section = True
         self.requesting_critical_section = False
         
-        global SHARED_CHAR_COUNT
-
         if self.hash_cracker.found_word is None:
-            # AQUI É ONDE A MUDANÇA É FEITA
-            char_count_to_process = SHARED_CHAR_COUNT
-            SHARED_CHAR_COUNT += 1 # Incrementa a variável global para a próxima rodada
+            char_count_to_process = self.get_shared_char_count()
             
-            found = self.hash_cracker.process_combinations(char_count_to_process)
-            
-            if found:
-                print(f"[SUCCESS] Palavra encontrada: {self.hash_cracker.found_word}")
-                self.exit_critical_section(found=True)
-            else:
-                self.exit_critical_section()
+            # --- CORREÇÃO AQUI ---
+            processing_thread = threading.Thread(target=self.process_task, args=(char_count_to_process,))
+            processing_thread.start()
+            # --- FIM DA CORREÇÃO ---
         else:
             self.exit_critical_section()
+    
+    def process_task(self, char_count):
+        found = self.hash_cracker.process_combinations(char_count)
+        if found:
+            print(f"[SUCCESS] Palavra encontrada: {self.hash_cracker.found_word}")
+            self.exit_critical_section(found=True)
+        else:
+            self.exit_critical_section()
+    
+    def get_shared_char_count(self):
+        if self.is_coordinator:
+            char_count = self.shared_char_count
+            self.shared_char_count += 1
+            return char_count
+        else:
+            coordinator_address = None
+            for peer_address, peer_info in self.peer_list.items():
+                if peer_info.get("is_coordinator"):
+                    coordinator_address = peer_address
+                    break
+
+            if not coordinator_address:
+                print("[ERROR] Coordenador não encontrado na lista de peers.")
+                return 0
+
+            request_message = {"type": "get_char_count_request", "clock": self.lamport_clock}
+            
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                peer_info = self.peer_list[coordinator_address]
+                s.connect((peer_info['host'], peer_info['port']))
+                s.sendall(json.dumps(request_message).encode('utf-8'))
+                
+                response_data = s.recv(1024).decode('utf-8')
+                response = json.loads(response_data)
+                s.close()
+                return response['char_count']
+            except Exception as e:
+                print(f"[ERROR] Erro ao obter contador do coordenador: {e}")
+                return 0
 
     def exit_critical_section(self, found=False):
         self.in_critical_section = False
@@ -235,38 +280,20 @@ class Node:
         self.deferred_replies = []
         self.replies_received = 0
         
-        global SHARED_CHAR_COUNT
         if not found and self.hash_cracker.found_word is None:
-            self.request_access()
+            threading.Thread(target=self.request_access).start()
         elif found:
-            # Envia a mensagem de "encontrado" para todos os nós
             message = {"type": "found_word", "word": self.hash_cracker.found_word, "clock": self.lamport_clock}
             for peer_address, peer_info in self.peer_list.items():
                 if peer_address != f"{self.host}:{self.port}":
                     Utils.send_message(peer_info['host'], peer_info['port'], message)
 
-            # Zera a variável global para o próximo teste
-            SHARED_CHAR_COUNT = 1
-
 if __name__ == '__main__':
-    # cd Documentos/Faculdade/Sistemas\ Distribuídos/hack_md5/
-    # python3 hack_md5.py
-
     ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits + string.punctuation
     TARGET_HASH = "a70a73db01b6f55210b1c884c5808c67"
 
-    # node1 = Node(5000, TARGET_HASH, ALPHABET)
-    # node1.start_server()
+    node1 = Node(5000, TARGET_HASH, ALPHABET, is_coordinator=True)
+    node1.start_server()
+    time.sleep(2)
 
-    # O Nó 2 vai rodar isso mais conexão com Nó 1
-    node2 = Node(5001, TARGET_HASH, ALPHABET)
-    node2.start_server()
-    time.sleep(1) # Aguarda 1 segundo
-    node2.connect_to_peer('127.0.0.1', 5000)
-
-    # O Nó 3 vai rodar isso mais conexão com Nó 2
-    # node3 = Node(5002, TARGET_HASH, ALPHABET)
-    # node3.start_server()
-    # time.sleep(1)
-    # node3.connect_to_peer('127.0.0.1', 5001)
     pass
